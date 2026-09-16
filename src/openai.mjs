@@ -403,9 +403,12 @@ const transformFnResponse = ({ content, tool_call_id }, parts) => {
   let response;
   try {
     response = JSON.parse(content);
-  } catch (err) {
-    console.error("Error parsing function response content:", err);
-    throw new HttpError("Invalid function response: " + content, 400);
+  } catch {
+    // Tool output is frequently NOT JSON — shell stdout, file listings, stack
+    // traces, any multi-line plain text. Gemini's functionResponse.response must
+    // be an object, so wrap the raw text instead of failing the whole request.
+    console.error("Non-JSON function response, wrapping as text");
+    response = { result: typeof content === "string" ? content : String(content ?? "") };
   }
   if (typeof response !== "object" || response === null || Array.isArray(response)) {
     response = { result: response };
@@ -438,9 +441,11 @@ const transformFnCalls = ({ tool_calls }) => {
     let args;
     try {
       args = JSON.parse(argstr);
-    } catch (err) {
-      console.error("Error parsing function arguments:", err);
-      throw new HttpError("Invalid function arguments: " + argstr, 400);
+    } catch {
+      // Tolerate empty / non-JSON argument strings (e.g. no-arg tools) rather
+      // than failing the whole request with 400.
+      console.error("Non-JSON function arguments, defaulting to {}");
+      args = {};
     }
     calls[id] = {i, name};
     return {
@@ -448,7 +453,15 @@ const transformFnCalls = ({ tool_calls }) => {
         id: id.startsWith("call_") ? null : id,
         name,
         args,
-      }
+      },
+      // Gemini 3 requires a thoughtSignature on the first functionCall of every
+      // step. Replayed OpenAI-format history never carries one (the field has no
+      // OpenAI equivalent), which triggers:
+      //   400 "... missing a thought_signature in functionCall parts"
+      // Google's documented escape hatch is the literal sentinel below. It must
+      // stay a plain string — base64-encoding it (as some SDKs do with bytes)
+      // makes Gemini reject it as "not valid".
+      ...(i === 0 ? { thoughtSignature: "skip_thought_signature_validator" } : {}),
     };
   });
   parts.calls = calls;
