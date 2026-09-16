@@ -15,13 +15,13 @@ export default {
       return new Response(err.message, fixCors({ status: err.status ?? 500 }));
     };
     try {
+      // Comma-separated keys are supported ("k1,k2,k3"). Gemini free-tier rate
+      // limits are enforced per Google Cloud PROJECT, not per API key, so keys
+      // sourced from separate projects each add a full quota. requestGoogle()
+      // rotates across them and retries on 429 instead of failing outright.
       const auth = request.headers.get("Authorization");
-      let apiKey = auth?.split(" ")[1];
-      if (apiKey && apiKey.includes(',')) {
-        const apiKeys = apiKey.split(',').map(k => k.trim()).filter(k => k);
-        apiKey = apiKeys[Math.floor(Math.random() * apiKeys.length)];
-        console.log(`OpenAI Selected API Key: ${apiKey}`);
-      }
+      const rawKey = auth?.split(" ")[1] ?? "";
+      const apiKeys = rawKey.split(",").map(k => k.trim()).filter(Boolean);
       const assert = (success) => {
         if (!success) {
           throw new HttpError("The specified HTTP method is not allowed for the requested resource", 400);
@@ -31,15 +31,15 @@ export default {
       switch (true) {
         case pathname.endsWith("/chat/completions"):
           assert(request.method === "POST");
-          return handleCompletions(await request.json(), apiKey)
+          return handleCompletions(await request.json(), apiKeys)
             .catch(errHandler);
         case pathname.endsWith("/embeddings"):
           assert(request.method === "POST");
-          return handleEmbeddings(await request.json(), apiKey)
+          return handleEmbeddings(await request.json(), apiKeys)
             .catch(errHandler);
         case pathname.endsWith("/models"):
           assert(request.method === "GET");
-          return handleModels(apiKey)
+          return handleModels(apiKeys)
             .catch(errHandler);
         default:
           throw new HttpError("404 Not Found", 404);
@@ -85,9 +85,109 @@ const makeHeaders = (apiKey, more) => ({
   ...more
 });
 
-async function handleModels (apiKey) {
+// ---------------------------------------------------------------------------
+// Multi-key rotation with quota-aware back-off.
+//
+// Why: Gemini's free tier allows ~250k tokens/minute (TPM) *per project* plus a
+// per-project daily cap. A long agent session re-sends the whole context on
+// every tool round-trip, so one key saturates almost instantly and Google
+// answers 429 RESOURCE_EXHAUSTED. Because the limit is per project — not per
+// key — supplying keys from several projects multiplies the ceiling.
+//
+// What this does:
+//   1. Picks a key that is not currently cooling down (randomised).
+//   2. On 429/503 it parks that key for the delay Google asks for (RetryInfo
+//      retryDelay), or a token-aware estimate when that is absent, then retries.
+//   3. Retries instantly if another key is free; otherwise waits briefly
+//      (capped) before trying again.
+//
+// State is per-isolate and best-effort: Deno Deploy may run several isolates, so
+// cooldowns are not globally shared. That is fine — the goal is simply to stop
+// hammering a key that just said "stop".
+// ---------------------------------------------------------------------------
+const MAX_KEY_ATTEMPTS = 4;
+const FREE_TIER_TPM = 250000;      // free-tier tokens-per-minute, per project
+const MAX_RETRY_WAIT_MS = 5000;    // never block a single request longer than this
+
+const keyCooldown = new Map();     // apiKey -> epoch ms at which it becomes usable
+
+const pickKey = (keys) => {
+  if (!keys || keys.length === 0) { return undefined; }
+  const now = Date.now();
+  const ready = keys.filter(k => (keyCooldown.get(k) ?? 0) <= now);
+  const pool = ready.length ? ready : keys;
+  return pool[Math.floor(Math.random() * pool.length)];
+};
+
+const coolKey = (key, ms) => {
+  if (!key) { return; }
+  const until = Date.now() + ms;
+  if ((keyCooldown.get(key) ?? 0) < until) { keyCooldown.set(key, until); }
+  if (keyCooldown.size > 256) {          // opportunistic cleanup
+    const now = Date.now();
+    for (const [k, v] of keyCooldown) { if (v <= now) { keyCooldown.delete(k); } }
+  }
+};
+
+const parseRetryDelayMs = (text, approxTokens) => {
+  try {
+    const details = JSON.parse(text)?.error?.details ?? [];
+    for (const item of details) {
+      const m = typeof item?.retryDelay === "string"
+        ? item.retryDelay.match(/^([\d.]+)s$/)
+        : null;
+      if (m) {
+        return Math.min(Math.ceil(parseFloat(m[1]) * 1000), 60000);
+      }
+    }
+  } catch { /* body was not JSON */ }
+  // Token-aware fallback (same model as gemini-flux): cooldown ≈ tokens / TPM.
+  const minutes = approxTokens / FREE_TIER_TPM;
+  return Math.min(Math.max(Math.ceil(minutes * 60000), 3000), 60000);
+};
+
+const isQuotaError = (status, text) =>
+  status === 429 || status === 503 || /RESOURCE_EXHAUSTED|exceeded your current quota/i.test(text);
+
+// Request Google with key rotation. On success the caller receives the live
+// Response (body untouched). On final failure it receives a rebuilt Response
+// carrying Google's error body, so the client still sees the real status/message.
+const requestGoogle = async ({ url, keys, method = "POST", body, contentType = "application/json" }) => {
+  const keyList = Array.isArray(keys) && keys.length ? keys : [undefined];
+  const approxTokens = body ? Math.ceil(body.length / 4) : 0;
+  let response;
+  let text = "";
+  for (let attempt = 0; attempt < MAX_KEY_ATTEMPTS; attempt++) {
+    const key = pickKey(keyList);
+    response = await fetch(url, {
+      method,
+      headers: makeHeaders(key, contentType ? { "Content-Type": contentType } : undefined),
+      body,
+    });
+    if (response.ok) { return response; }
+    try { text = await response.text(); } catch { text = ""; }
+    if (!isQuotaError(response.status, text)) { break; }
+    coolKey(key, parseRetryDelayMs(text, approxTokens));
+    if (attempt === MAX_KEY_ATTEMPTS - 1) { break; }
+    const now = Date.now();
+    const anyReady = keyList.some(k => (keyCooldown.get(k) ?? 0) <= now);
+    if (!anyReady) {
+      const soonest = Math.min(...keyList.map(k => (keyCooldown.get(k) ?? 0) - now));
+      if (soonest > MAX_RETRY_WAIT_MS) { break; }   // not worth blocking the caller
+      await new Promise(r => setTimeout(r, Math.max(soonest, 250)));
+    }
+    console.log(`Gemini quota hit (${response.status}); retrying (attempt ${attempt + 2}/${MAX_KEY_ATTEMPTS})`);
+  }
+  return new Response(text, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+};
+
+async function handleModels (apiKeys) {
   const response = await fetch(`${BASE_URL}/${API_VERSION}/models`, {
-    headers: makeHeaders(apiKey),
+    headers: makeHeaders(pickKey(apiKeys)),
   });
   let { body } = response;
   if (response.ok) {
@@ -108,7 +208,7 @@ async function handleModels (apiKey) {
 }
 
 const DEFAULT_EMBEDDINGS_MODEL = "text-embedding-004";
-async function handleEmbeddings (req, apiKey) {
+async function handleEmbeddings (req, apiKeys) {
   if (typeof req.model !== "string") {
     throw new HttpError("model is not specified", 400);
   }
@@ -124,9 +224,9 @@ async function handleEmbeddings (req, apiKey) {
   if (!Array.isArray(req.input)) {
     req.input = [ req.input ];
   }
-  const response = await fetch(`${BASE_URL}/${API_VERSION}/${model}:batchEmbedContents`, {
-    method: "POST",
-    headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
+  const response = await requestGoogle({
+    url: `${BASE_URL}/${API_VERSION}/${model}:batchEmbedContents`,
+    keys: apiKeys,
     body: JSON.stringify({
       "requests": req.input.map(text => ({
         model,
@@ -154,7 +254,7 @@ async function handleEmbeddings (req, apiKey) {
 }
 
 const DEFAULT_MODEL = "gemini-2.5-flash";
-async function handleCompletions (req, apiKey) {
+async function handleCompletions (req, apiKeys) {
   let model = DEFAULT_MODEL;
   switch (true) {
     case typeof req.model !== "string":
@@ -193,9 +293,9 @@ async function handleCompletions (req, apiKey) {
   const TASK = req.stream ? "streamGenerateContent" : "generateContent";
   let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
   if (req.stream) { url += "?alt=sse"; }
-  const response = await fetch(url, {
-    method: "POST",
-    headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
+  const response = await requestGoogle({
+    url,
+    keys: apiKeys,
     body: JSON.stringify(body),
   });
 
