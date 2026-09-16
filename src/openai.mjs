@@ -515,19 +515,27 @@ const transformMessages = async (messages) => {
       case "system":
         system_instruction = { parts: await transformMsg(item) };
         continue;
-      case "tool":
-        // eslint-disable-next-line no-case-declarations
-        let { role, parts } = contents[contents.length - 1] ?? {};
-        if (role !== "function") {
+      case "tool": {
+        // Gemini's Content role whitelist is now USER / MODEL only. Newer models
+        // (e.g. gemini-3.6-flash) reject the legacy role outright:
+        //   400 Role 'function' is not supported. Please use a valid role: ...
+        // The official Gen AI SDK also returns functionResponse parts on a "user"
+        // turn. Consecutive tool results must still be merged into ONE turn, so we
+        // tag the parts array with an internal marker instead of relying on role —
+        // JSON.stringify ignores array properties, so it is never sent upstream.
+        let { parts } = contents[contents.length - 1] ?? {};
+        if (!parts?.isFnResponse) {
           const calls = parts?.calls;
           parts = []; parts.calls = calls;
+          parts.isFnResponse = true;
           contents.push({
-            role: "function", // ignored
+            role: "user", // functionResponse must ride on a user turn
             parts
           });
         }
         transformFnResponse(item, parts);
         continue;
+      }
       case "assistant":
         item.role = "model";
         break;
